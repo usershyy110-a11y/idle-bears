@@ -39,8 +39,8 @@ local function makeButton(text, posX, color)
 	return btn, frame
 end
 
-local feedBtn,  feedFrame  = makeButton("🥕 האכל",  20,  Color3.fromRGB(220, 130, 50))
-local waterBtn, waterFrame = makeButton("💧 השקה", 165, Color3.fromRGB(70, 140, 220))
+local feedBtn,  feedFrame  = makeButton("🥕 Feed",  20,  Color3.fromRGB(220, 130, 50))
+local waterBtn, waterFrame = makeButton("💧 Water", 165, Color3.fromRGB(70, 140, 220))
 
 -- תצוגת גיל
 local ageLabel = Instance.new("TextLabel")
@@ -51,7 +51,7 @@ ageLabel.BackgroundTransparency = 0.35
 ageLabel.TextColor3         = Color3.fromRGB(255, 255, 220)
 ageLabel.TextScaled         = true
 ageLabel.Font               = Enum.Font.GothamBold
-ageLabel.Text               = "🐻 גיל: ..."
+ageLabel.Text               = "🐻 Bear Age: ..."
 ageLabel.Parent             = gui
 
 local agecorner = Instance.new("UICorner")
@@ -65,7 +65,7 @@ local stats = plr:WaitForChild("BearStats")
 local Age   = stats:WaitForChild("Age")
 
 local function refreshAge()
-	ageLabel.Text = ("🐻 גיל: %d"):format(Age.Value)
+	ageLabel.Text = ("🐻 Bear Age: %d"):format(Age.Value)
 end
 refreshAge()
 Age:GetPropertyChangedSignal("Value"):Connect(refreshAge)
