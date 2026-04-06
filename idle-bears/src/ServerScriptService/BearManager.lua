@@ -29,6 +29,8 @@ local FeedRE         = remotes:WaitForChild("FeedBear")
 local WaterRE        = remotes:WaitForChild("WaterBear")
 local BuyFoodRE      = remotes:WaitForChild("BuyFood")
 local BuyDrinkRE     = remotes:WaitForChild("BuyDrink")
+local UseFoodRE      = remotes:WaitForChild("UseFood")
+local UseDrinkRE     = remotes:WaitForChild("UseDrink")
 
 local MAX_SLOTS      = 5
 local STARTING_COINS = 30
@@ -40,20 +42,39 @@ local FEED_AGE       = 2
 local WATER_AGE      = 1
 local ADMIN_ID       = 5647716264
 
+-- Foods: buy adds to inventory; use spends inventory + adds age per slot
 local FOOD_DEFS = {
-	["Honey"]        = {cost=5,   ageBonus=3},
-	["Berries"]      = {cost=15,  ageBonus=8},
-	["Salmon"]       = {cost=35,  ageBonus=20},
-	["Magic Fruit"]  = {cost=80,  ageBonus=50},
-	["Golden Apple"] = {cost=200, ageBonus=120},
+	["Honey"]           = {cost=5,    ageBonus=3},
+	["Berries"]         = {cost=15,   ageBonus=8},
+	["Salmon"]          = {cost=35,   ageBonus=20},
+	["Magic Fruit"]     = {cost=80,   ageBonus=50},
+	["Golden Apple"]    = {cost=200,  ageBonus=120},
+	-- New high-tier foods (x30 scaling)
+	["Dragon Fruit"]    = {cost=6000,  ageBonus=3600},
+	["Phoenix Berry"]   = {cost=18000, ageBonus=9600},
+	["Void Salmon"]     = {cost=42000, ageBonus=24000},
+	["Astral Melon"]    = {cost=96000, ageBonus=60000},
+	["Celestial Core"]  = {cost=240000,ageBonus=144000},
 }
+-- Drinks: buy adds to inventory; use activates multiplier
 local DRINK_DEFS = {
-	["Fresh Water"]   = {cost=8,   multiplier=1.5, duration=120},
-	["River Water"]   = {cost=20,  multiplier=2,   duration=180},
-	["Spring Water"]  = {cost=50,  multiplier=3,   duration=240},
-	["Mystic Water"]  = {cost=120, multiplier=5,   duration=300},
-	["Celestial Dew"] = {cost=300, multiplier=10,  duration=420},
+	["Fresh Water"]     = {cost=8,     multiplier=1.5, duration=120},
+	["River Water"]     = {cost=20,    multiplier=2,   duration=180},
+	["Spring Water"]    = {cost=50,    multiplier=3,   duration=240},
+	["Mystic Water"]    = {cost=120,   multiplier=5,   duration=300},
+	["Celestial Dew"]   = {cost=300,   multiplier=10,  duration=420},
+	-- New high-tier drinks (x30 scaling)
+	["Void Essence"]    = {cost=9000,  multiplier=15,  duration=600},
+	["Nebula Sap"]      = {cost=22500, multiplier=20,  duration=720},
+	["Star Bloom"]      = {cost=56250, multiplier=30,  duration=900},
+	["Aurora Elixir"]   = {cost=135000,multiplier=50,  duration=1200},
+	["Eternal Spring"]  = {cost=337500,multiplier=100, duration=1800},
 }
+
+-- Inventory default (used for new players and migration)
+local function defaultInventory()
+	return {foods={}, drinks={}}
+end
 
 local playerData        = {}
 local followConnections = {}
@@ -134,7 +155,7 @@ end
 -- ---- Data ----
 local function saveData(plr)
 	local pd=playerData[plr.UserId]; if not pd then return end
-	local saved={coins=pd.coins,followEnabled=pd.followEnabled,slots={}}
+	local saved={coins=pd.coins,followEnabled=pd.followEnabled,slots={},inventory=pd.inventory}
 	for i,s in ipairs(pd.slots) do
 		saved.slots[i]={tierId=s.tierId,age=s.age,petId=s.petId,createdAt=s.createdAt}
 	end
@@ -181,7 +202,12 @@ local function onPlayerAdded(plr)
 		coins=saved and saved.coins or STARTING_COINS,
 		followEnabled=saved and saved.followEnabled~=false or true,
 		slots={},drinkMultiplier=1,drinkExpiry=0,
+		inventory=saved and saved.inventory or defaultInventory(),
 	}
+	-- Migration: old saves without inventory
+	if not pd.inventory then pd.inventory=defaultInventory() end
+	if not pd.inventory.foods then pd.inventory.foods={} end
+	if not pd.inventory.drinks then pd.inventory.drinks={} end
 	playerData[plr.UserId]=pd
 	if saved and saved.slots and #saved.slots>0 then
 		for i,s in ipairs(saved.slots) do
@@ -237,22 +263,63 @@ WaterRE.OnServerEvent:Connect(function(plr)
 	if not playerData[plr.UserId] then return end
 	applyAge(plr,WATER_AGE); respond(plr,true,"💧 Watered! +"..WATER_AGE.." age")
 end)
-BuyFoodRE.OnServerEvent:Connect(function(plr,foodName)
+-- Buy food → add to inventory (no immediate effect)
+BuyFoodRE.OnServerEvent:Connect(function(plr,foodName,qty)
 	if type(foodName)~="string" then return end
 	local def=FOOD_DEFS[foodName]; if not def then return end
 	local pd=playerData[plr.UserId]; if not pd then return end
-	if pd.coins<def.cost then respond(plr,false,"Need 💰 "..def.cost); return end
-	pd.coins-=def.cost; applyAge(plr,def.ageBonus)
-	respond(plr,true,("Fed %s! +%d age. 💰 -%d"):format(foodName,def.ageBonus,def.cost))
+	qty=math.max(1,math.floor(tonumber(qty) or 1))
+	local total=def.cost*qty
+	if pd.coins<total then respond(plr,false,"Need 💰 "..total.." for "..qty.."x "..foodName); return end
+	pd.coins-=total
+	pd.inventory.foods[foodName]=(pd.inventory.foods[foodName] or 0)+qty
+	respond(plr,true,("Bought %dx %s! 💰 -%d"):format(qty,foodName,total))
 	broadcastSlots(plr); saveData(plr)
 end)
-BuyDrinkRE.OnServerEvent:Connect(function(plr,drinkName)
+
+-- Buy drink → add to inventory
+BuyDrinkRE.OnServerEvent:Connect(function(plr,drinkName,qty)
 	if type(drinkName)~="string" then return end
 	local def=DRINK_DEFS[drinkName]; if not def then return end
 	local pd=playerData[plr.UserId]; if not pd then return end
-	if pd.coins<def.cost then respond(plr,false,"Need 💰 "..def.cost); return end
-	pd.coins-=def.cost; pd.drinkMultiplier=def.multiplier; pd.drinkExpiry=os.clock()+def.duration
-	respond(plr,true,("Drank %s! x%.1f for %ds 💰 -%d"):format(drinkName,def.multiplier,def.duration,def.cost))
+	qty=math.max(1,math.floor(tonumber(qty) or 1))
+	local total=def.cost*qty
+	if pd.coins<total then respond(plr,false,"Need 💰 "..total.." for "..qty.."x "..drinkName); return end
+	pd.coins-=total
+	pd.inventory.drinks[drinkName]=(pd.inventory.drinks[drinkName] or 0)+qty
+	respond(plr,true,("Bought %dx %s! 💰 -%d"):format(qty,drinkName,total))
+	broadcastSlots(plr); saveData(plr)
+end)
+
+-- Use food from inventory → apply age to all slots (bulk)
+UseFoodRE.OnServerEvent:Connect(function(plr,foodName,qty)
+	if type(foodName)~="string" then return end
+	local def=FOOD_DEFS[foodName]; if not def then return end
+	local pd=playerData[plr.UserId]; if not pd then return end
+	qty=math.max(1,math.floor(tonumber(qty) or 1))
+	local have=pd.inventory.foods[foodName] or 0
+	if have<qty then respond(plr,false,("Only have %d %s"):format(have,foodName)); return end
+	pd.inventory.foods[foodName]=have-qty
+	applyAge(plr,def.ageBonus*qty)
+	respond(plr,true,("Used %dx %s! +%d age 🥕"):format(qty,foodName,def.ageBonus*qty))
+	broadcastSlots(plr); saveData(plr)
+end)
+
+-- Use drink from inventory → activate multiplier
+UseDrinkRE.OnServerEvent:Connect(function(plr,drinkName,qty)
+	if type(drinkName)~="string" then return end
+	local def=DRINK_DEFS[drinkName]; if not def then return end
+	local pd=playerData[plr.UserId]; if not pd then return end
+	qty=math.max(1,math.floor(tonumber(qty) or 1))
+	local have=pd.inventory.drinks[drinkName] or 0
+	if have<qty then respond(plr,false,("Only have %d %s"):format(have,drinkName)); return end
+	pd.inventory.drinks[drinkName]=have-qty
+	-- Stacks duration, caps multiplier at highest used
+	local newMult=math.max(pd.drinkMultiplier,def.multiplier)
+	local addedDuration=def.duration*qty
+	pd.drinkMultiplier=newMult
+	pd.drinkExpiry=math.max(pd.drinkExpiry,os.clock())+addedDuration
+	respond(plr,true,("Drank %dx %s! x%.0f for +%ds 💧"):format(qty,drinkName,newMult,addedDuration))
 	broadcastSlots(plr); saveData(plr)
 end)
 BuyBearRE.OnServerEvent:Connect(function(plr,tierIdx)
