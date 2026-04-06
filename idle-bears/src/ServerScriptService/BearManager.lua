@@ -1,17 +1,23 @@
 -- ================================================
--- BearManager v2: slots, buy, upgrade, follow, food, drink, admin
+-- BearManager v4 — slim, delegates to VF + LB
+-- Public API: GetPlayerData, ForceSetCoins
+-- Admin chat: /coins add|remove|set <player> <n>
+--             /addbear <tierId>
 -- ================================================
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local DataStoreService = game:GetService("DataStoreService")
-local DS               = DataStoreService:GetDataStore("BearData_v2")
-local Chat             = game:GetService("Chat")
+local HttpService      = game:GetService("HttpService")
+local DS               = DataStoreService:GetDataStore("BearData_v4")
 
-local RS      = game.ReplicatedStorage
-local remotes = RS:WaitForChild("RemoteEvents")
-local tiers   = require(RS:WaitForChild("BearTiers"))
-local SS      = game.ServerStorage
-local models  = SS:WaitForChild("BearModels")
+local RS       = game.ReplicatedStorage
+local remotes  = RS:WaitForChild("RemoteEvents")
+local tiers    = require(RS:WaitForChild("BearTiers"))
+local VF       = require(RS:WaitForChild("BrainrotVisualFactory"))
+local LB       = require(game:GetService("ServerScriptService"):WaitForChild("LeaderboardService"))
+
+local SS           = game.ServerStorage
+local prefabFolder = SS:FindFirstChild("BrainrotModels")
 
 local BuyBearRE      = remotes:WaitForChild("BuyBear")
 local UpgradeRE      = remotes:WaitForChild("UpgradeBear")
@@ -24,18 +30,15 @@ local WaterRE        = remotes:WaitForChild("WaterBear")
 local BuyFoodRE      = remotes:WaitForChild("BuyFood")
 local BuyDrinkRE     = remotes:WaitForChild("BuyDrink")
 
--- ---- Config ----
 local MAX_SLOTS      = 5
 local STARTING_COINS = 30
-local FOLLOW_SPEED   = 14
+local FOLLOW_SPEED   = 12
 local FOLLOW_GAP     = 5
-local IDLE_INTERVAL  = 30   -- seconds per idle age tick
-local FEED_AGE       = 2    -- age bonus per manual feed
-local WATER_AGE      = 1    -- age bonus per manual water
+local IDLE_INTERVAL  = 30
+local FEED_AGE       = 2
+local WATER_AGE      = 1
+local ADMIN_ID       = 5647716264
 
-local ADMIN_ID = 5647716264  -- DY110TD
-
--- Valid food/drink definitions (server-side validation)
 local FOOD_DEFS = {
 	["Honey"]        = {cost=5,   ageBonus=3},
 	["Berries"]      = {cost=15,  ageBonus=8},
@@ -51,19 +54,24 @@ local DRINK_DEFS = {
 	["Celestial Dew"] = {cost=300, multiplier=10,  duration=420},
 }
 
--- ---- State ----
-local playerData        = {}  -- [uid] = {coins, slots, followEnabled, drinkBoost, drinkExpiry}
+local playerData        = {}
 local followConnections = {}
+local M                 = {}
 
 -- ---- Helpers ----
+local function newPetId(uid, i)
+	return ("%d_%d_%s"):format(uid, i, HttpService:GenerateGUID(false):sub(1,8))
+end
 local function getTierById(id)
 	for i,t in ipairs(tiers) do if t.id==id then return t,i end end
 	return tiers[1],1
 end
 local function getBuyPrice(idx)    return math.floor(tiers[idx].sellPrice*0.8) end
-local function getUpgradePrice(fi,ti) if ti>#tiers then return math.huge end return math.floor((tiers[ti].sellPrice-tiers[fi].sellPrice)*0.7) end
+local function getUpgradePrice(fi,ti)
+	if ti>#tiers then return math.huge end
+	return math.floor((tiers[ti].sellPrice-tiers[fi].sellPrice)*0.7)
+end
 local function respond(plr,ok,msg) RespRE:FireClient(plr,ok,msg) end
-
 local function broadcastSlots(plr)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local info={}
@@ -74,31 +82,25 @@ local function broadcastSlots(plr)
 	SlotUpdateRE:FireClient(plr,pd.coins,info,pd.followEnabled)
 end
 
--- ---- Bear models ----
-local function spawnBearModel(plr,slotIdx,tierId)
-	local pd=playerData[plr.UserId]; if not pd then return end
-	local slot=pd.slots[slotIdx]; if not slot then return end
-	if slot.model and slot.model.Parent then slot.model:Destroy() end
-	local src=models:FindFirstChild("Bear_"..tierId); if not src then return end
-	local clone=src:Clone()
-	clone.Name=("PlayerBear_%d_%d"):format(plr.UserId,slotIdx)
-	clone.Parent=workspace
+-- ---- Spawn ----
+local function targetCF(plr,slotIdx)
 	local char=plr.Character
 	local root=char and char:FindFirstChild("HumanoidRootPart")
-	local basePos=root and root.Position or Vector3.new(0,5,0)
-	local offset=Vector3.new((slotIdx-1)*FOLLOW_GAP,0,6)
-	for _,p in ipairs(clone:GetDescendants()) do
-		if p:IsA("BasePart") then
-			p.CFrame=p.CFrame+basePos+offset; p.Anchored=true; p.CanCollide=false
-		end
-	end
-	slot.model=clone; return clone
+	local base=root and root.Position or Vector3.new(0,5,0)
+	return CFrame.new(base+Vector3.new((slotIdx-1)*FOLLOW_GAP,2.5,6))
 end
-
-local function despawnBearModel(plr,slotIdx)
+local function spawnBrainrot(plr,slotIdx)
+	local pd=playerData[plr.UserId]; if not pd then return end
+	local slot=pd.slots[slotIdx]; if not slot then return end
+	VF.despawnModel(slot.model)
+	local tier=getTierById(slot.tierId)
+	slot.model=VF.spawnModel(tier,prefabFolder,targetCF(plr,slotIdx),
+		("PlayerBrainrot_%d_%d"):format(plr.UserId,slotIdx))
+end
+local function despawnBrainrot(plr,slotIdx)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local slot=pd.slots[slotIdx]
-	if slot and slot.model and slot.model.Parent then slot.model:Destroy(); slot.model=nil end
+	if slot then VF.despawnModel(slot.model); slot.model=nil end
 end
 
 -- ---- Follow ----
@@ -111,20 +113,18 @@ local function startFollow(plr)
 		local root=char and char:FindFirstChild("HumanoidRootPart"); if not root then return end
 		local fwd=root.CFrame.LookVector; local right=root.CFrame.RightVector
 		for i,slot in ipairs(pd.slots) do
-			if slot.model and slot.model.Parent then
+			if slot.model and slot.model.Parent and slot.model.PrimaryPart then
 				local row=math.ceil(i/3); local col=((i-1)%3)-1
-				local target=root.Position-fwd*(FOLLOW_GAP*row+FOLLOW_GAP)+right*(col*FOLLOW_GAP*0.8)
-				local body=slot.model:FindFirstChild("Body"); if not body then continue end
-				local newPos=body.Position:Lerp(target,math.min(dt*FOLLOW_SPEED,1))
-				local delta=newPos-body.Position
-				for _,p in ipairs(slot.model:GetDescendants()) do
-					if p:IsA("BasePart") then p.CFrame=p.CFrame+delta end
-				end
+				local target=root.Position
+					-fwd*(FOLLOW_GAP*row+FOLLOW_GAP)
+					+right*(col*FOLLOW_GAP*0.8)
+					+Vector3.new(0,2.5,0)
+				local cur=slot.model.PrimaryPart.Position
+				VF.moveModel(slot.model,CFrame.new(cur:Lerp(target,math.min(dt*FOLLOW_SPEED,1))))
 			end
 		end
 	end)
 end
-
 local function stopFollow(plr)
 	local uid=plr.UserId
 	if followConnections[uid] then followConnections[uid]:Disconnect(); followConnections[uid]=nil end
@@ -134,240 +134,233 @@ end
 local function saveData(plr)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local saved={coins=pd.coins,followEnabled=pd.followEnabled,slots={}}
-	for i,s in ipairs(pd.slots) do saved.slots[i]={tierId=s.tierId,age=s.age} end
-	pcall(function() DS:SetAsync("bearv2:"..plr.UserId,saved) end)
+	for i,s in ipairs(pd.slots) do
+		saved.slots[i]={tierId=s.tierId,age=s.age,petId=s.petId,createdAt=s.createdAt}
+	end
+	pcall(function() DS:SetAsync("bearv4:"..plr.UserId,saved) end)
+	LB.UpdateCoins(plr.UserId,pd.coins)
+	for _,slot in ipairs(pd.slots) do LB.UpdatePet(plr.UserId,plr.Name,slot) end
 end
 local function loadData(plr)
-	local ok,data=pcall(function() return DS:GetAsync("bearv2:"..plr.UserId) end)
-	if ok and data then return data end; return nil
+	local ok,data=pcall(function() return DS:GetAsync("bearv4:"..plr.UserId) end)
+	if ok and data then return data end
+	return nil
 end
 
--- ---- Age helper: apply age to all bears and auto-upgrade ----
+-- ---- Age ----
 local function applyAge(plr,amount)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	for i,slot in ipairs(pd.slots) do
 		slot.age+=amount
 		local _,ci=getTierById(slot.tierId)
 		if ci<#tiers and slot.age>=tiers[ci+1].minAge then
-			slot.tierId=tiers[ci+1].id
-			spawnBearModel(plr,i,slot.tierId)
+			slot.tierId=tiers[ci+1].id; spawnBrainrot(plr,i)
 		end
 	end
 	broadcastSlots(plr)
 end
 
--- ---- Player Added ----
+-- ---- Public API ----
+function M.GetPlayerData(uid) return playerData[uid] end
+
+function M.ForceSetCoins(plr, newAmount)
+	local pd=playerData[plr.UserId]; if not pd then return end
+	pd.coins=math.max(0,math.floor(newAmount))
+	local ls=plr:FindFirstChild("leaderstats")
+	if ls and ls:FindFirstChild("Coins") then ls.Coins.Value=pd.coins end
+	local stats=plr:FindFirstChild("BearStats")
+	if stats and stats:FindFirstChild("Coins") then stats.Coins.Value=pd.coins end
+	broadcastSlots(plr); saveData(plr)
+end
+
+-- ---- Player lifecycle ----
 local function onPlayerAdded(plr)
 	local saved=loadData(plr)
 	local pd={
 		coins=saved and saved.coins or STARTING_COINS,
 		followEnabled=saved and saved.followEnabled~=false or true,
-		slots={},
-		drinkMultiplier=1,
-		drinkExpiry=0,
+		slots={},drinkMultiplier=1,drinkExpiry=0,
 	}
 	playerData[plr.UserId]=pd
-
 	if saved and saved.slots and #saved.slots>0 then
-		for _,s in ipairs(saved.slots) do
-			table.insert(pd.slots,{tierId=s.tierId or "t1",age=s.age or 0,model=nil})
+		for i,s in ipairs(saved.slots) do
+			table.insert(pd.slots,{
+				tierId=s.tierId or "t1",age=s.age or 0,
+				petId=s.petId or newPetId(plr.UserId,i),
+				createdAt=s.createdAt or os.time(),model=nil,
+			})
 		end
 	else
-		table.insert(pd.slots,{tierId="t1",age=0,model=nil})
+		table.insert(pd.slots,{
+			tierId="t1",age=0,
+			petId=newPetId(plr.UserId,1),createdAt=os.time(),model=nil,
+		})
 	end
-
 	local ls=Instance.new("Folder"); ls.Name="leaderstats"; ls.Parent=plr
-	local lsC=Instance.new("IntValue"); lsC.Name="Coins"; lsC.Value=pd.coins; lsC.Parent=ls
-	local lsB=Instance.new("IntValue"); lsB.Name="Bears"; lsB.Value=#pd.slots; lsB.Parent=ls
+	local lsC=Instance.new("IntValue"); lsC.Name="Coins";     lsC.Value=pd.coins; lsC.Parent=ls
+	local lsB=Instance.new("IntValue"); lsB.Name="Brainrots"; lsB.Value=#pd.slots; lsB.Parent=ls
 	local stats=Instance.new("Folder"); stats.Name="BearStats"; stats.Parent=plr
 	local cv=Instance.new("IntValue"); cv.Name="Coins"; cv.Value=pd.coins; cv.Parent=stats
-
 	local function onChar()
 		task.wait(1)
-		for i,slot in ipairs(pd.slots) do spawnBearModel(plr,i,slot.tierId) end
+		for i in ipairs(pd.slots) do spawnBrainrot(plr,i) end
 		if pd.followEnabled then startFollow(plr) end
 		broadcastSlots(plr)
 	end
 	if plr.Character then task.spawn(onChar) end
 	plr.CharacterAdded:Connect(function() task.spawn(onChar) end)
-
 	task.spawn(function()
-		while plr.Parent do
-			task.wait(2)
-			local curr=playerData[plr.UserId]
-			if curr then lsC.Value=curr.coins; cv.Value=curr.coins; lsB.Value=#curr.slots end
+		while plr.Parent do task.wait(2)
+			local c=playerData[plr.UserId]
+			if c then lsC.Value=c.coins; cv.Value=c.coins; lsB.Value=#c.slots end
 		end
 	end)
-	task.spawn(function()
-		while plr.Parent do task.wait(60); saveData(plr) end
-	end)
+	task.spawn(function() while plr.Parent do task.wait(60); saveData(plr) end end)
+	LB.UpdateCoins(plr.UserId,pd.coins)
+	for _,slot in ipairs(pd.slots) do LB.UpdatePet(plr.UserId,plr.Name,slot) end
 end
 
 local function onPlayerRemoving(plr)
 	stopFollow(plr); saveData(plr)
 	local pd=playerData[plr.UserId]
-	if pd then for i in ipairs(pd.slots) do despawnBearModel(plr,i) end end
+	if pd then for i in ipairs(pd.slots) do despawnBrainrot(plr,i) end end
 	playerData[plr.UserId]=nil
 end
 
--- ================================================
--- EVENTS
--- ================================================
-
--- Feed Bear (manual +2 age)
+-- ---- Remote Events ----
 FeedRE.OnServerEvent:Connect(function(plr)
-	local pd=playerData[plr.UserId]; if not pd then return end
-	applyAge(plr,FEED_AGE)
-	respond(plr,true,"🥕 Bear fed! +2 age")
+	if not playerData[plr.UserId] then return end
+	applyAge(plr,FEED_AGE); respond(plr,true,"🥕 Fed! +"..FEED_AGE.." age")
 end)
-
--- Water Bear (manual +1 age)
 WaterRE.OnServerEvent:Connect(function(plr)
-	local pd=playerData[plr.UserId]; if not pd then return end
-	applyAge(plr,WATER_AGE)
-	respond(plr,true,"💧 Bear watered! +1 age")
+	if not playerData[plr.UserId] then return end
+	applyAge(plr,WATER_AGE); respond(plr,true,"💧 Watered! +"..WATER_AGE.." age")
 end)
-
--- Buy Food
-BuyFoodRE.OnServerEvent:Connect(function(plr,foodName,foodCost,ageBonus)
+BuyFoodRE.OnServerEvent:Connect(function(plr,foodName)
 	if type(foodName)~="string" then return end
 	local def=FOOD_DEFS[foodName]; if not def then return end
-	local cost=def.cost; local bonus=def.ageBonus
 	local pd=playerData[plr.UserId]; if not pd then return end
-	if pd.coins<cost then respond(plr,false,"Not enough coins! Need 💰 "..cost); return end
-	pd.coins-=cost
-	applyAge(plr,bonus)
-	respond(plr,true,("Fed %s! Bear grew +%d age. 💰 -%d"):format(foodName,bonus,cost))
+	if pd.coins<def.cost then respond(plr,false,"Need 💰 "..def.cost); return end
+	pd.coins-=def.cost; applyAge(plr,def.ageBonus)
+	respond(plr,true,("Fed %s! +%d age. 💰 -%d"):format(foodName,def.ageBonus,def.cost))
 	broadcastSlots(plr); saveData(plr)
 end)
-
--- Buy Drink (boosts idle growth rate)
-BuyDrinkRE.OnServerEvent:Connect(function(plr,drinkName,drinkCost,multiplier,duration)
+BuyDrinkRE.OnServerEvent:Connect(function(plr,drinkName)
 	if type(drinkName)~="string" then return end
 	local def=DRINK_DEFS[drinkName]; if not def then return end
-	local cost=def.cost; local mult=def.multiplier; local dur=def.duration
 	local pd=playerData[plr.UserId]; if not pd then return end
-	if pd.coins<cost then respond(plr,false,"Not enough coins! Need 💰 "..cost); return end
-	pd.coins-=cost
-	pd.drinkMultiplier=mult
-	pd.drinkExpiry=os.clock()+dur
-	respond(plr,true,("Drank %s! Idle growth x%.1f for %ds 💰 -%d"):format(drinkName,mult,dur,cost))
+	if pd.coins<def.cost then respond(plr,false,"Need 💰 "..def.cost); return end
+	pd.coins-=def.cost; pd.drinkMultiplier=def.multiplier; pd.drinkExpiry=os.clock()+def.duration
+	respond(plr,true,("Drank %s! x%.1f for %ds 💰 -%d"):format(drinkName,def.multiplier,def.duration,def.cost))
 	broadcastSlots(plr); saveData(plr)
 end)
-
--- Buy Bear
 BuyBearRE.OnServerEvent:Connect(function(plr,tierIdx)
 	tierIdx=tonumber(tierIdx)
 	if not tierIdx or tierIdx<1 or tierIdx>#tiers then return end
 	local pd=playerData[plr.UserId]; if not pd then return end
-	if #pd.slots>=MAX_SLOTS then respond(plr,false,"Max "..MAX_SLOTS.." bears!"); return end
+	if #pd.slots>=MAX_SLOTS then respond(plr,false,"Max "..MAX_SLOTS.." brainrots!"); return end
 	local price=getBuyPrice(tierIdx)
 	if pd.coins<price then respond(plr,false,"Need 💰 "..price); return end
 	pd.coins-=price
-	local ns={tierId=tiers[tierIdx].id,age=tiers[tierIdx].minAge,model=nil}
-	table.insert(pd.slots,ns)
-	spawnBearModel(plr,#pd.slots,ns.tierId)
+	local ns={tierId=tiers[tierIdx].id,age=tiers[tierIdx].minAge,
+		petId=newPetId(plr.UserId,#pd.slots+1),createdAt=os.time(),model=nil}
+	table.insert(pd.slots,ns); spawnBrainrot(plr,#pd.slots)
 	respond(plr,true,("Bought %s %s! 💰 -%d"):format(tiers[tierIdx].emoji,tiers[tierIdx].name,price))
-	broadcastSlots(plr); saveData(plr)
+	LB.UpdatePet(plr.UserId,plr.Name,ns); broadcastSlots(plr); saveData(plr)
 end)
-
--- Upgrade Bear
 UpgradeRE.OnServerEvent:Connect(function(plr,slotIdx)
 	slotIdx=tonumber(slotIdx); if not slotIdx then return end
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local slot=pd.slots[slotIdx]; if not slot then respond(plr,false,"Invalid slot"); return end
-	local _,ci=getTierById(slot.tierId)
-	local ni=ci+1
+	local _,ci=getTierById(slot.tierId); local ni=ci+1
 	if ni>#tiers then respond(plr,false,"Max tier! 👑"); return end
 	local price=getUpgradePrice(ci,ni)
 	if pd.coins<price then respond(plr,false,"Need 💰 "..price.." for "..tiers[ni].name); return end
 	pd.coins-=price; slot.tierId=tiers[ni].id; slot.age=tiers[ni].minAge
-	spawnBearModel(plr,slotIdx,slot.tierId)
+	spawnBrainrot(plr,slotIdx)
 	respond(plr,true,("Upgraded to %s %s! 💰 -%d"):format(tiers[ni].emoji,tiers[ni].name,price))
-	broadcastSlots(plr); saveData(plr)
+	LB.UpdatePet(plr.UserId,plr.Name,slot); broadcastSlots(plr); saveData(plr)
 end)
-
--- Toggle Follow
 ToggleFollowRE.OnServerEvent:Connect(function(plr)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	pd.followEnabled=not pd.followEnabled
-	if pd.followEnabled then startFollow(plr); respond(plr,true,"Bears following! 🐻")
-	else stopFollow(plr); respond(plr,true,"Bears stopped.") end
+	if pd.followEnabled then startFollow(plr); respond(plr,true,"Following! 🧠")
+	else stopFollow(plr); respond(plr,true,"Stopped.") end
 	broadcastSlots(plr)
 end)
-
--- Sell Bear
 SellRE.OnServerEvent:Connect(function(plr,slotIdx)
 	slotIdx=tonumber(slotIdx) or 1
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local slot=pd.slots[slotIdx]; if not slot then respond(plr,false,"Invalid slot"); return end
 	local tier=getTierById(slot.tierId)
-	pd.coins+=tier.sellPrice
-	despawnBearModel(plr,slotIdx)
-	table.remove(pd.slots,slotIdx)
-	for i,s in ipairs(pd.slots) do
-		if s.model then s.model:Destroy(); s.model=nil end
-		spawnBearModel(plr,i,s.tierId)
-	end
+	pd.coins+=tier.sellPrice; despawnBrainrot(plr,slotIdx); table.remove(pd.slots,slotIdx)
+	for i,s in ipairs(pd.slots) do VF.despawnModel(s.model); s.model=nil; spawnBrainrot(plr,i) end
 	respond(plr,true,("Sold %s %s for 💰 %d!"):format(tier.emoji,tier.name,tier.sellPrice))
 	broadcastSlots(plr); saveData(plr)
 end)
 
--- ================================================
--- ADMIN COMMANDS (chat: /coins 5000 | /addbear t5)
--- ================================================
+-- ---- Admin Chat Commands ----
+local function findPlayer(text)
+	text=text:lower()
+	for _,p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower():sub(1,#text)==text then return p end
+		if p.DisplayName:lower():sub(1,#text)==text then return p end
+	end
+	return nil
+end
+
 Players.PlayerAdded:Connect(function(plr)
 	plr.Chatted:Connect(function(msg)
 		if plr.UserId~=ADMIN_ID then return end
-		local cmd,arg=msg:match("^(/[%a]+)%s*(.*)")
-		if not cmd then return end
-		cmd=cmd:lower()
+		local parts=msg:split(" ")
+		local cmd=parts[1] and parts[1]:lower()
 
-		if cmd=="/coins" then
-			local amount=tonumber(arg)
-			if not amount then respond(plr,false,"Usage: /coins <amount>"); return end
-			local pd=playerData[plr.UserId]; if not pd then return end
-			pd.coins+=amount
-			respond(plr,true,("Admin: +💰 %d (total: %d)"):format(amount,pd.coins))
-			broadcastSlots(plr); saveData(plr)
+		if cmd=="/coins" and #parts>=4 then
+			local action=parts[2]:lower()
+			if action~="add" and action~="remove" and action~="set" then return end
+			local amount=math.max(0,math.floor(tonumber(parts[4]) or 0))
+			local target=findPlayer(parts[3])
+			if not target then respond(plr,false,"Player not found: "..parts[3]); return end
+			local pd=playerData[target.UserId]
+			if not pd then respond(plr,false,"No data for "..target.Name); return end
+			local new
+			if action=="add" then new=pd.coins+amount
+			elseif action=="remove" then new=math.max(0,pd.coins-amount)
+			else new=amount end
+			M.ForceSetCoins(target,new)
+			respond(plr,true,("Admin: %s %s → 💰%d"):format(action,target.Name,new))
+			respond(target,true,("💰 Admin adjusted your coins to %d"):format(new))
 
 		elseif cmd=="/addbear" then
-			local tierId=arg:match("^%s*(%S+)%s*$") or "t1"
+			local tierId=parts[2] or "t1"
 			local pd=playerData[plr.UserId]; if not pd then return end
-			if #pd.slots>=MAX_SLOTS then respond(plr,false,"Max slots reached!"); return end
-			local foundTier=nil
-			for _,t in ipairs(tiers) do if t.id==tierId then foundTier=t; break end end
-			if not foundTier then respond(plr,false,"Unknown tier: "..tierId); return end
-			local ns={tierId=foundTier.id,age=foundTier.minAge,model=nil}
-			table.insert(pd.slots,ns)
-			spawnBearModel(plr,#pd.slots,foundTier.id)
-			respond(plr,true,("Admin: Added %s %s (slot %d)"):format(foundTier.emoji,foundTier.name,#pd.slots))
-			broadcastSlots(plr); saveData(plr)
+			if #pd.slots>=MAX_SLOTS then respond(plr,false,"Max slots!"); return end
+			local ft
+			for _,t in ipairs(tiers) do if t.id==tierId then ft=t; break end end
+			if not ft then respond(plr,false,"Unknown tier: "..tierId); return end
+			local ns={tierId=ft.id,age=ft.minAge,petId=newPetId(plr.UserId,#pd.slots+1),createdAt=os.time(),model=nil}
+			table.insert(pd.slots,ns); spawnBrainrot(plr,#pd.slots)
+			respond(plr,true,("Admin: Added %s %s"):format(ft.emoji,ft.name))
+			LB.UpdatePet(plr.UserId,plr.Name,ns); broadcastSlots(plr); saveData(plr)
 		end
 	end)
 end)
 
--- ================================================
--- IDLE GROWTH LOOP (respects drink boost)
--- ================================================
+-- ---- Idle Growth Loop ----
 task.spawn(function()
-	while true do
-		task.wait(IDLE_INTERVAL)
+	while true do task.wait(IDLE_INTERVAL)
 		for uid,pd in pairs(playerData) do
 			local plr=Players:GetPlayerByUserId(uid)
 			local mult=1
-			if pd.drinkExpiry and os.clock()<pd.drinkExpiry then
-				mult=pd.drinkMultiplier or 1
-			else
-				pd.drinkMultiplier=1; pd.drinkExpiry=0
-			end
-			local growth=math.floor(1*mult)
+			if pd.drinkExpiry and os.clock()<pd.drinkExpiry then mult=pd.drinkMultiplier or 1
+			else pd.drinkMultiplier=1; pd.drinkExpiry=0 end
+			local growth=math.max(1,math.floor(mult))
 			for i,slot in ipairs(pd.slots) do
 				slot.age+=growth
 				local _,ci=getTierById(slot.tierId)
 				if ci<#tiers and slot.age>=tiers[ci+1].minAge then
 					slot.tierId=tiers[ci+1].id
-					if plr then spawnBearModel(plr,i,slot.tierId) end
+					if plr then spawnBrainrot(plr,i) end
 				end
 			end
 			if plr then broadcastSlots(plr) end
@@ -375,12 +368,10 @@ task.spawn(function()
 	end
 end)
 
--- ================================================
--- INIT
--- ================================================
+-- ---- Init ----
 Players.PlayerAdded:Connect(onPlayerAdded)
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 for _,plr in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded,plr) end
-
-print("[BearManager v2] loaded OK")
-return {}
+LB.Start()
+print("[BrainrotManager v4] loaded OK")
+return M
