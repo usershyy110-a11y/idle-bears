@@ -1,8 +1,8 @@
 -- ================================================
--- BearManager v4 — slim, delegates to VF + LB
+-- BearManager v4 — Phase 2 UI-Ready
 -- Public API: GetPlayerData, ForceSetCoins
--- Admin chat: /coins add|remove|set <player> <n>
---             /addbear <tierId>
+-- Remotes: InventorySync (push), ConsumeRequest/ConsumeResponse (Zero Trust)
+-- Admin: /boards, /coins, /addbear
 -- ================================================
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
@@ -15,6 +15,8 @@ local remotes  = RS:WaitForChild("RemoteEvents")
 local tiers    = require(RS:WaitForChild("BearTiers"))
 local VF       = require(RS:WaitForChild("BrainrotVisualFactory"))
 local LB       = require(game:GetService("ServerScriptService"):WaitForChild("LeaderboardService"))
+local Registry = require(RS:WaitForChild("ItemRegistry"))
+local EC       = Registry.ErrorCodes
 
 local SS           = game.ServerStorage
 local prefabFolder = SS:FindFirstChild("BrainrotModels")
@@ -31,16 +33,21 @@ local BuyFoodRE      = remotes:WaitForChild("BuyFood")
 local BuyDrinkRE     = remotes:WaitForChild("BuyDrink")
 local UseFoodRE      = remotes:WaitForChild("UseFood")
 local UseDrinkRE     = remotes:WaitForChild("UseDrink")
+-- New Phase 2 UI remotes
+local InvSyncRE      = remotes:WaitForChild("InventorySync")
+local ConsumeReqRE   = remotes:WaitForChild("ConsumeRequest")
+local ConsumeRespRE  = remotes:WaitForChild("ConsumeResponse")
 
-local MAX_SLOTS      = 5
-local STARTING_COINS = 30
-local AGE_MULTIPLIER = 1.5
-local FOLLOW_SPEED   = 12
-local FOLLOW_GAP     = 5
-local IDLE_INTERVAL  = 30
-local FEED_AGE       = 2
-local WATER_AGE      = 1
-local ADMIN_ID       = 5647716264
+local MAX_SLOTS        = 5
+local STARTING_COINS   = 30
+local AGE_MULTIPLIER   = 1.5
+local FOLLOW_SPEED     = 12
+local FOLLOW_GAP       = 5
+local IDLE_INTERVAL    = 30
+local FEED_AGE         = 2
+local WATER_AGE        = 1
+local ADMIN_ID         = 5647716264
+local CONSUME_COOLDOWN = 0.5  -- seconds between ConsumeRequests per player
 
 -- Foods: buy adds to inventory; use spends inventory + adds age per slot
 local FOOD_DEFS = {
@@ -182,6 +189,36 @@ local function applyAge(plr,amount)
 	broadcastSlots(plr)
 end
 
+-- ---- petId targeting (Section 4) ----
+local function getPetSlotByPetId(uid, petId)
+	local pd = playerData[uid]; if not pd then return nil end
+	for i, slot in ipairs(pd.slots) do
+		if slot.petId == petId then return i, slot end
+	end
+	return nil
+end
+
+-- ---- InventorySync push (Section 2 + 5) ----
+local function pushInventorySync(plr)
+	local pd = playerData[plr.UserId]; if not pd then return end
+	InvSyncRE:FireClient(plr, {
+		version     = Registry.SNAPSHOT_VERSION,
+		foods       = pd.inventory.foods,
+		drinks      = pd.inventory.drinks,
+		selectedPetId = pd.slots[1] and pd.slots[1].petId or nil,
+		serverTime  = os.time(),
+	})
+end
+
+-- ---- ConsumeResponse helper ----
+local function consumeResp(plr, success, code, message)
+	ConsumeRespRE:FireClient(plr, {
+		success = success,
+		code    = code or (success and "OK" or EC.INTERNAL_ERROR),
+		message = message,
+	})
+end
+
 -- ---- Public API ----
 function M.GetPlayerData(uid) return playerData[uid] end
 
@@ -233,6 +270,7 @@ local function onPlayerAdded(plr)
 		for i in ipairs(pd.slots) do spawnBrainrot(plr,i) end
 		if pd.followEnabled then startFollow(plr) end
 		broadcastSlots(plr)
+		pushInventorySync(plr)  -- full snapshot on join
 	end
 	if plr.Character then task.spawn(onChar) end
 	plr.CharacterAdded:Connect(function() task.spawn(onChar) end)
@@ -435,6 +473,77 @@ Players.PlayerAdded:Connect(function(plr)
 			LB.UpdatePet(plr.UserId,plr.Name,ns); broadcastSlots(plr); saveData(plr)
 		end
 	end)
+end)
+
+-- ---- ConsumeRequest — Zero Trust handler (Sections 2, 3, 4) ----
+local consumeCooldowns = {}  -- [userId] = last os.clock()
+
+ConsumeReqRE.OnServerEvent:Connect(function(plr, petId, itemId, amount)
+	local uid = plr.UserId
+	local pd  = playerData[uid]
+
+	-- Section 3: rate limit
+	local now = os.clock()
+	if (consumeCooldowns[uid] or 0) + CONSUME_COOLDOWN > now then
+		consumeResp(plr, false, EC.RATE_LIMITED, "Too fast — wait a moment")
+		return
+	end
+	consumeCooldowns[uid] = now
+
+	if not pd then
+		consumeResp(plr, false, EC.INTERNAL_ERROR, "Player data not loaded"); return
+	end
+
+	-- Section 3: validate amount
+	amount = math.floor(tonumber(amount) or 0)
+	if amount < 1 then
+		consumeResp(plr, false, EC.INVALID_AMOUNT, "Amount must be a positive integer"); return
+	end
+
+	-- Section 3: validate item exists in Registry
+	local item = Registry.Get(itemId)
+	if not item then
+		consumeResp(plr, false, EC.ITEM_NOT_FOUND, "Unknown item: " .. tostring(itemId)); return
+	end
+
+	-- Section 4: validate petId ownership
+	local slotIdx, slot = getPetSlotByPetId(uid, petId)
+	if not slotIdx then
+		consumeResp(plr, false, EC.PET_NOT_FOUND, "Pet not found: " .. tostring(petId)); return
+	end
+
+	-- Section 3: validate inventory stock
+	local inv   = item.category == "Food" and pd.inventory.foods or pd.inventory.drinks
+	local have  = inv[itemId] or 0
+	if have < amount then
+		consumeResp(plr, false, EC.INSUFFICIENT_STOCK,
+			("Have %d, need %d %s"):format(have, amount, itemId)); return
+	end
+
+	-- Commit — server mutates state first, then notifies client
+	inv[itemId] = have - amount
+
+	if item.category == "Food" then
+		slot.age += item.effectValue * amount
+		-- Check tier upgrade
+		local _, ci = getTierById(slot.tierId)
+		if ci < #tiers and slot.age >= tiers[ci+1].minAge then
+			slot.tierId = tiers[ci+1].id
+			spawnBrainrot(plr, slotIdx)
+		end
+	else -- Drink
+		local newMult = math.max(pd.drinkMultiplier, item.effectValue)
+		pd.drinkMultiplier = newMult
+		pd.drinkExpiry = math.max(pd.drinkExpiry, os.clock()) + (item.duration * amount)
+	end
+
+	-- Push updated state to client
+	pushInventorySync(plr)
+	broadcastSlots(plr)
+	saveData(plr)
+
+	consumeResp(plr, true, "OK",
+		("Used %dx %s on %s"):format(amount, item.displayName, slot.tierId))
 end)
 
 -- ---- Idle Growth Loop ----
