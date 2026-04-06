@@ -32,6 +32,7 @@ local BuyDrinkRE     = remotes:WaitForChild("BuyDrink")
 
 local MAX_SLOTS      = 5
 local STARTING_COINS = 30
+local AGE_MULTIPLIER = 1.5
 local FOLLOW_SPEED   = 12
 local FOLLOW_GAP     = 5
 local IDLE_INTERVAL  = 30
@@ -293,9 +294,10 @@ SellRE.OnServerEvent:Connect(function(plr,slotIdx)
 	local pd=playerData[plr.UserId]; if not pd then return end
 	local slot=pd.slots[slotIdx]; if not slot then respond(plr,false,"Invalid slot"); return end
 	local tier=getTierById(slot.tierId)
-	pd.coins+=tier.sellPrice; despawnBrainrot(plr,slotIdx); table.remove(pd.slots,slotIdx)
+	local finalPrice=math.floor(tier.sellPrice + slot.age * AGE_MULTIPLIER)
+	pd.coins+=finalPrice; despawnBrainrot(plr,slotIdx); table.remove(pd.slots,slotIdx)
 	for i,s in ipairs(pd.slots) do VF.despawnModel(s.model); s.model=nil; spawnBrainrot(plr,i) end
-	respond(plr,true,("Sold %s %s for 💰 %d!"):format(tier.emoji,tier.name,tier.sellPrice))
+	respond(plr,true,("Sold %s %s for 💰 %d! (age bonus: +%d)"):format(tier.emoji,tier.name,finalPrice,math.floor(slot.age*AGE_MULTIPLIER)))
 	broadcastSlots(plr); saveData(plr)
 end)
 
@@ -315,7 +317,29 @@ Players.PlayerAdded:Connect(function(plr)
 		local parts=msg:split(" ")
 		local cmd=parts[1] and parts[1]:lower()
 
-		if cmd=="/coins" and #parts>=4 then
+		if cmd=="/boards" then
+			local action=parts[2] and parts[2]:lower()
+			if action=="refresh" then
+				LB.ForceRefresh()
+				respond(plr,true,"Boards refreshed ✓")
+			elseif action=="remove" and parts[3] then
+				local sub=parts[3]:lower()
+				if sub=="coins" and parts[4] then
+					local target=findPlayer(parts[4])
+					if not target then respond(plr,false,"Player not found: "..parts[4]); return end
+					LB.RemoveFromCoins(target.UserId)
+					respond(plr,true,"Removed "..target.Name.." from Coins board")
+				elseif sub=="pet" and parts[4] then
+					LB.RemoveFromPetBoards(parts[4])
+					respond(plr,true,"Removed pet "..parts[4].." from pet boards")
+				else
+					respond(plr,false,"Usage: /boards remove coins <player> | /boards remove pet <petId>")
+				end
+			else
+				respond(plr,false,"Usage: /boards refresh | /boards remove coins <player> | /boards remove pet <petId>")
+			end
+
+		elseif cmd=="/coins" and #parts>=4 then
 			local action=parts[2]:lower()
 			if action~="add" and action~="remove" and action~="set" then return end
 			local amount=math.max(0,math.floor(tonumber(parts[4]) or 0))

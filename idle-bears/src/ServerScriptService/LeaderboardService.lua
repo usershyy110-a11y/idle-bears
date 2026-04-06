@@ -207,6 +207,42 @@ local function refreshNewestBoard(container)
 	end
 end
 
+-- ---- Public: Force refresh all boards ----
+function LeaderboardService.ForceRefresh()
+	local boards = workspace:FindFirstChild("Leaderboards")
+	if not boards then return end
+	local cb = boards:FindFirstChild("CoinsBoard")
+	local ob = boards:FindFirstChild("OldestBoard")
+	local nb = boards:FindFirstChild("NewestBoard")
+	if cb then pcall(refreshCoinsBoard,  getOrMakeGui(cb)) end
+	if ob then pcall(refreshOldestBoard, getOrMakeGui(ob)) end
+	if nb then pcall(refreshNewestBoard, getOrMakeGui(nb)) end
+end
+
+-- ---- Public: Remove player from coins board ----
+function LeaderboardService.RemoveFromCoins(userId)
+	task.spawn(function()
+		local ok, err = pcall(function()
+			CoinsODS:RemoveAsync(tostring(userId))
+		end)
+		if ok then
+			LeaderboardService.ForceRefresh()
+		else
+			warn("[LeaderboardService] RemoveFromCoins failed:", err)
+		end
+	end)
+end
+
+-- ---- Public: Remove pet from pet boards ----
+function LeaderboardService.RemoveFromPetBoards(petId)
+	task.spawn(function()
+		pcall(function() OldestODS:RemoveAsync(petId) end)
+		pcall(function() NewestODS:RemoveAsync(petId) end)
+		pcall(function() PetMetaDS:RemoveAsync(petId) end)
+		LeaderboardService.ForceRefresh()
+	end)
+end
+
 -- ---- Public: Start refresh loop ----
 function LeaderboardService.Start()
 	task.spawn(function()
